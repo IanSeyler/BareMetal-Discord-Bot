@@ -8,6 +8,7 @@
 // git clone https://github.com/ReturnInfinity/BareMetal-App
 // cp discord_bot.c BareMetal-App/
 // cd BareMetal-App
+// ./setup.sh
 // ./1-build.sh discord_bot.c
 // ./2-run.sh
 // ./3-upload.sh - optional to upload to BareMetal Cloud
