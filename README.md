@@ -1,2 +1,4 @@
 # BareMetal-Discord-Bot
-A simple Discord bot that repeats messages directed to it in pig latin
+A simple Discord bot that repeats messages directed to it in pig latin.
+
+Runs on *nix and BareMetal.
