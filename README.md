@@ -16,7 +16,7 @@ In a world where "small" usually still means a few hundred MiB, this bot has bee
 
 ![Running in a 4 MiB BareMetal Cloud microVM](images/baremetal.png)
 
-And here it is replying in the wild, in the [Return Infinity Discord](https://discord.gg/cUR3bE67u) `#test` channel:
+And here it is replying in the wild, in the [Return Infinity Discord](https://discord.gg/cUR3bE67u) `#testing` channel:
 
 ![Pig Latin Bot replying in Discord](images/discord.png)
 
