@@ -115,6 +115,7 @@
 
 #define POLL_INTERVAL_SECS 3
 #define MAX_MSG_OBJS       10 // must match the `limit` query param used below
+#define MAX_CONSECUTIVE_FAILURES 5 // see consecutive_failures in main()
 
 #define MSG_BUF_SIZE       (32 * 1024) // GET /messages response (up to MAX_MSG_OBJS messages)
 #define OBJ_BUF_SIZE       4096        // one message object, copied out of msg_buf
@@ -145,26 +146,38 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
 	return n; // report all of n "written" even on overflow - see curltest.c's write_cb
 }
 
-// libcurl setup shared by every request below.
-static void curl_common_opts(CURL *h)
+// libcurl setup shared by every request below. If force_fresh is set, the
+// call is forbidden from reusing a cached connection - see http_get()'s
+// comment for why the retry path needs this.
+static void curl_common_opts(CURL *h, int force_fresh)
 {
 	curl_easy_setopt(h, CURLOPT_USERAGENT, USER_AGENT);
 	curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L); // see file header
 	curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
 	curl_easy_setopt(h, CURLOPT_TIMEOUT, 30L); // matches net_shim.c's own per-call cap
+	if (force_fresh)
+		curl_easy_setopt(h, CURLOPT_FRESH_CONNECT, 1L);
 }
 
 // GETs url with the given "Authorization: Bot ..." header into mb.
 // Returns the HTTP status, or -1 on a transport-level failure (mb still
 // holds whatever partial body, if any, curl delivered before that).
-static long http_get(CURL *h, const char *url, const char *auth_header, struct membuf *mb)
+//
+// force_fresh forbids reusing a cached connection. curl_easy_reset()
+// below only resets *options* back to their defaults - per libcurl's own
+// docs it deliberately leaves the handle's connection cache, DNS cache,
+// and TLS session cache untouched. So after a connect/SSL-level failure,
+// the next call on this same handle can still try to reuse the same
+// poisoned cached connection instead of opening a new one - the caller
+// should pass force_fresh=1 on the retry right after such a failure.
+static long http_get(CURL *h, const char *url, const char *auth_header, struct membuf *mb, int force_fresh)
 {
 	mb->len = 0;
 	mb->data[0] = '\0';
 
 	curl_easy_reset(h); // undoes any leftover POST state from a previous call on this handle
-	curl_common_opts(h);
+	curl_common_opts(h, force_fresh);
 	curl_easy_setopt(h, CURLOPT_URL, url);
 	curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
 	curl_easy_setopt(h, CURLOPT_WRITEDATA, mb);
@@ -187,13 +200,13 @@ static long http_get(CURL *h, const char *url, const char *auth_header, struct m
 // POSTs a JSON payload (paylen bytes) to url with the given auth header
 // into mb. Same return convention as http_get().
 static long http_post(CURL *h, const char *url, const char *auth_header,
-		       const char *payload, size_t paylen, struct membuf *mb)
+		       const char *payload, size_t paylen, struct membuf *mb, int force_fresh)
 {
 	mb->len = 0;
 	mb->data[0] = '\0';
 
 	curl_easy_reset(h);
-	curl_common_opts(h);
+	curl_common_opts(h, force_fresh);
 	curl_easy_setopt(h, CURLOPT_URL, url);
 	curl_easy_setopt(h, CURLOPT_POST, 1L);
 	curl_easy_setopt(h, CURLOPT_POSTFIELDS, payload);
@@ -435,6 +448,49 @@ static int mentions_bot(const char *content, const char *bot_id)
 	return strstr(content, pat) != NULL || strstr(content, pat_nick) != NULL;
 }
 
+// Removes every occurrence of this bot's own "<@id>"/"<@!id>" mention
+// token from content, so a reply built from it doesn't itself contain
+// that self-mention: pig_latin_text() deliberately passes whole
+// "<...>" tokens through unmangled (see its comment), so left alone,
+// the very mention that triggered this reply would survive verbatim
+// into the reply text and re-ping the bot. Whitespace between
+// surviving tokens is normalized to single spaces; leading/trailing
+// space is dropped.
+static void strip_self_mention(const char *content, const char *bot_id, char *out, size_t outsz)
+{
+	char pat[40], pat_nick[40];
+	snprintf(pat, sizeof(pat), "<@%s>", bot_id);
+	snprintf(pat_nick, sizeof(pat_nick), "<@!%s>", bot_id);
+	size_t pat_len = strlen(pat), pat_nick_len = strlen(pat_nick);
+
+	size_t pos = 0;
+	const char *p = content;
+	int need_space = 0;
+
+	while (*p) {
+		while (*p && isspace((unsigned char)*p))
+			p++;
+		if (!*p)
+			break;
+
+		const char *tok = p;
+		while (*p && !isspace((unsigned char)*p))
+			p++;
+		size_t tok_len = (size_t)(p - tok);
+
+		if ((tok_len == pat_len && strncmp(tok, pat, tok_len) == 0) ||
+		    (tok_len == pat_nick_len && strncmp(tok, pat_nick, tok_len) == 0))
+			continue; // drop the bot's own mention token
+
+		if (need_space && pos + 1 < outsz)
+			out[pos++] = ' ';
+		for (size_t i = 0; i < tok_len && pos + 1 < outsz; i++)
+			out[pos++] = tok[i];
+		need_space = 1;
+	}
+	out[pos] = '\0';
+}
+
 static int is_vowel(char c)
 {
 	c = (char)tolower((unsigned char)c);
@@ -632,7 +688,7 @@ int main(void)
 	{
 		char url[128];
 		snprintf(url, sizeof(url), "%s/users/@me", DISCORD_API_BASE);
-		long status = http_get(h, url, auth_header, &msg_mb);
+		long status = http_get(h, url, auth_header, &msg_mb, 0);
 		if (status == 200)
 			json_extract_string(msg_buf, "id", bot_id, sizeof(bot_id));
 		if (bot_id[0] == '\0') {
@@ -653,7 +709,7 @@ int main(void)
 	{
 		char url[300];
 		snprintf(url, sizeof(url), "%s?limit=1", get_url);
-		long status = http_get(h, url, auth_header, &msg_mb);
+		long status = http_get(h, url, auth_header, &msg_mb, 0);
 		if (status == 200) {
 			const char *starts[1];
 			size_t lens[1];
@@ -674,22 +730,49 @@ int main(void)
 	printf("watching channel %s as user %s, starting after message id %s\n\n",
 	       DISCORD_CHANNEL_ID, bot_id, last_id);
 
+	// Consecutive transport-level GET failures (status == -1: timeout,
+	// connect failure, SSL error, ...). curl_easy_reset() doesn't clear
+	// the handle's connection/DNS/TLS-session caches (see http_get()'s
+	// comment), so a failure past the first one forces a fresh
+	// connection rather than letting curl retry through a cached
+	// connection that may be the reason it's failing. If failures keep
+	// piling up regardless, the handle itself gets torn down and
+	// recreated from scratch as a last resort against any other
+	// wedged internal state a plain reset can't reach.
+	int consecutive_failures = 0;
+
 	for (;;) {
 		char url[300];
 		snprintf(url, sizeof(url), "%s?limit=%d&after=%s", get_url, MAX_MSG_OBJS, last_id);
 
-		long status = http_get(h, url, auth_header, &msg_mb);
+		long status = http_get(h, url, auth_header, &msg_mb, consecutive_failures > 0);
 
 		if (status == 429) {
+			consecutive_failures = 0;
 			wait_out_rate_limit(msg_mb.data);
 			continue;
 		}
 		if (status != 200) {
-			fprintf(stderr, "GET messages failed (HTTP %ld), retrying in %ds\n",
-				status, POLL_INTERVAL_SECS);
+			consecutive_failures++;
+			fprintf(stderr, "GET messages failed (HTTP %ld), retrying in %ds (%d consecutive)\n",
+				status, POLL_INTERVAL_SECS, consecutive_failures);
+
+			if (consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
+				fprintf(stderr, "too many consecutive GET failures, reinitializing curl handle\n");
+				curl_easy_cleanup(h);
+				h = curl_easy_init();
+				if (!h) {
+					fprintf(stderr, "curl_easy_init() failed during reinit, giving up\n");
+					curl_global_cleanup();
+					return 1;
+				}
+				consecutive_failures = 0;
+			}
+
 			sleep(POLL_INTERVAL_SECS);
 			continue;
 		}
+		consecutive_failures = 0;
 
 		const char *starts[MAX_MSG_OBJS];
 		size_t lens[MAX_MSG_OBJS];
@@ -721,8 +804,15 @@ int main(void)
 			if (!mentions_bot(content, bot_id))
 				continue; // only reply when directly @mentioned - see file header
 
+			static char stripped[CONTENT_BUF_SIZE];
+			strip_self_mention(content, bot_id, stripped, sizeof(stripped));
+
 			static char reply[REPLY_BUF_SIZE];
-			pig_latin_text(content, reply, sizeof(reply));
+			// Falls back to the untouched content on the rare message
+			// that's nothing but the mention (e.g. just "@bot") -
+			// stripping it down there would leave an empty reply,
+			// which Discord's API rejects outright.
+			pig_latin_text(stripped[0] ? stripped : content, reply, sizeof(reply));
 
 			int truncated = strlen(reply) > CONTENT_MAX - 3;
 			truncate_utf8(reply, truncated ? CONTENT_MAX - 3 : CONTENT_MAX);
@@ -746,7 +836,7 @@ int main(void)
 			static char post_resp[POST_RESP_SIZE];
 			struct membuf post_mb = { post_resp, sizeof(post_resp), 0 };
 
-			long pstatus = http_post(h, post_url, auth_header, payload, pos, &post_mb);
+			long pstatus = http_post(h, post_url, auth_header, payload, pos, &post_mb, 0);
 			if (pstatus == 429) {
 				wait_out_rate_limit(post_resp);
 			} else if (pstatus < 200 || pstatus >= 300) {
