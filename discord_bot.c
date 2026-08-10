@@ -101,6 +101,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <curl/curl.h>
@@ -125,6 +126,19 @@
 #define PAYLOAD_BUF_SIZE   (8 * 1024)  // JSON POST body for the reply
 #define POST_RESP_SIZE     4096
 #define CONTENT_MAX        1900 // Discord hard-caps message content at 2000 UTF-8 chars; leave headroom
+
+// Prints "[YYYY-MM-DD HH:MM:SS] " (UTC) to stream, right before a log
+// line at each call site below. UTC avoids depending on a local
+// timezone database, which this port doesn't carry.
+static void print_timestamp(FILE *stream)
+{
+	time_t now = time(NULL);
+	struct tm tm;
+	gmtime_r(&now, &tm);
+	char buf[20];
+	strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+	fprintf(stream, "[%s] ", buf);
+}
 
 struct membuf {
 	char *data;
@@ -191,6 +205,7 @@ static long http_get(CURL *h, const char *url, const char *auth_header, struct m
 	curl_slist_free_all(headers);
 
 	if (res != CURLE_OK) {
+		print_timestamp(stderr);
 		fprintf(stderr, "GET %s failed: %s\n", url, curl_easy_strerror(res));
 		return -1;
 	}
@@ -224,6 +239,7 @@ static long http_post(CURL *h, const char *url, const char *auth_header,
 	curl_slist_free_all(headers);
 
 	if (res != CURLE_OK) {
+		print_timestamp(stderr);
 		fprintf(stderr, "POST %s failed: %s\n", url, curl_easy_strerror(res));
 		return -1;
 	}
@@ -646,15 +662,18 @@ static void wait_out_rate_limit(const char *resp_body)
 	int secs = (int)(retry + 1.0);
 	if (secs < 1)
 		secs = 1;
+	print_timestamp(stderr);
 	fprintf(stderr, "rate limited, sleeping %ds\n", secs);
 	sleep((unsigned)secs);
 }
 
 int main(void)
 {
+	print_timestamp(stdout);
 	printf("BareMetal discord_bot - polls a channel, replies in Pig Latin\n\n");
 
 	if (DISCORD_BOT_TOKEN[0] == '\0' || DISCORD_CHANNEL_ID[0] == '\0') {
+		print_timestamp(stderr);
 		fprintf(stderr, "error: DISCORD_BOT_TOKEN and/or DISCORD_CHANNEL_ID is empty - "
 				"edit discord_bot.c and set both before building. See the file "
 				"header for how to create a bot, invite it, and find a channel "
@@ -666,6 +685,7 @@ int main(void)
 
 	CURL *h = curl_easy_init();
 	if (!h) {
+		print_timestamp(stderr);
 		fprintf(stderr, "curl_easy_init() failed\n");
 		curl_global_cleanup();
 		return 1;
@@ -692,6 +712,7 @@ int main(void)
 		if (status == 200)
 			json_extract_string(msg_buf, "id", bot_id, sizeof(bot_id));
 		if (bot_id[0] == '\0') {
+			print_timestamp(stderr);
 			fprintf(stderr, "error: couldn't fetch this bot's own user id from GET "
 					"/users/@me (HTTP %ld) - can't tell when it's been @mentioned "
 					"without it. Check DISCORD_BOT_TOKEN.\n", status);
@@ -722,11 +743,13 @@ int main(void)
 				json_extract_string(objbuf, "id", last_id, sizeof(last_id));
 			}
 		} else {
+			print_timestamp(stderr);
 			fprintf(stderr, "warning: couldn't seed the last message id (HTTP %ld) - "
 					"starting from scratch, which may replay recent history\n", status);
 		}
 	}
 
+	print_timestamp(stdout);
 	printf("watching channel %s as user %s, starting after message id %s\n\n",
 	       DISCORD_CHANNEL_ID, bot_id, last_id);
 
@@ -754,14 +777,17 @@ int main(void)
 		}
 		if (status != 200) {
 			consecutive_failures++;
+			print_timestamp(stderr);
 			fprintf(stderr, "GET messages failed (HTTP %ld), retrying in %ds (%d consecutive)\n",
 				status, POLL_INTERVAL_SECS, consecutive_failures);
 
 			if (consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
+				print_timestamp(stderr);
 				fprintf(stderr, "too many consecutive GET failures, reinitializing curl handle\n");
 				curl_easy_cleanup(h);
 				h = curl_easy_init();
 				if (!h) {
+					print_timestamp(stderr);
 					fprintf(stderr, "curl_easy_init() failed during reinit, giving up\n");
 					curl_global_cleanup();
 					return 1;
@@ -840,9 +866,11 @@ int main(void)
 			if (pstatus == 429) {
 				wait_out_rate_limit(post_resp);
 			} else if (pstatus < 200 || pstatus >= 300) {
+				print_timestamp(stderr);
 				fprintf(stderr, "reply to %s failed (HTTP %ld): %.*s\n",
 					id, pstatus, (int)post_mb.len, post_resp);
 			} else {
+				print_timestamp(stdout);
 				printf("[%s] %s -> %s\n", id, content, reply);
 			}
 		}
